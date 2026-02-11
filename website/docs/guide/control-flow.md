@@ -26,6 +26,52 @@ export component Truthy({ x }) {
 
 </Code>
 
+## Early Return
+
+Components support early `return;` inside top-level `if` blocks as a guard-clause pattern. When the return condition is met, the rest of the component body is skipped. Only one `return` per component is allowed.
+
+<Code>
+
+```ripple
+import { track } from 'ripple';
+
+export component App() {
+  let isLoading = track(true);
+
+  if (@isLoading) {
+    <div>{'Loading...'}</div>
+    return;
+  }
+  <div>{'Content loaded!'}</div>
+  <button onClick={() => @isLoading = true}>{'Reload'}</button>
+}
+```
+
+</Code>
+
+Early return also works with nested `if` blocks. The rest of the body is skipped when all conditions in the path to the `return` are true:
+
+<Code>
+
+```ripple
+export component Dashboard({ user, hasPermission }) {
+  if (user) {
+    <div>{'Welcome, '}{user.name}</div>
+    if (!hasPermission) {
+      <div>{'Access denied'}</div>
+      return;
+    }
+  }
+  <div>{'Dashboard content'}</div>
+}
+```
+
+</Code>
+
+::: info Note
+Early return is reactive - when conditions change, the rest of the component body will appear or disappear accordingly.
+:::
+
 ## Switch statements
 
 Switch statements let you conditionally render content based on a value. They work with both static and reactive values.

@@ -14,6 +14,17 @@ declare global {
 	var rpc_modules: RpcModules | undefined;
 }
 
+type NodeReturn = {
+	node: AST.ReturnStatement;
+	condition_path: AST.Expression[];
+	containing_node: AST.IfStatement | AST.Element | null;
+};
+
+export type ControlFlowChecks = {
+	registry: Map<AST.Node, { requirements: string[]; satisfied: boolean }[]>;
+	results: Map<AST.Node, string>;
+} | undefined;
+
 export type NameSpace = keyof typeof NAMESPACE_URI;
 interface BaseNodeMetaData {
 	scoped?: boolean;
@@ -26,6 +37,8 @@ interface BaseNodeMetaData {
 	parenthesized?: boolean;
 	elementLeadingComments?: AST.Comment[];
 	inside_component_top_level?: boolean;
+	has_return?: boolean;
+	returns?: NodeReturn[];
 }
 
 interface FunctionMetaData extends BaseNodeMetaData {
@@ -1198,6 +1211,10 @@ export interface AnalysisState extends BaseState {
 		styleClasses?: StyleClasses;
 	};
 	mode: CompileOptions['mode'];
+	control_flow_checks?: {
+		registry: Map<AST.Node, { requirements: string[]; satisfied: boolean }[]>;
+		results: Map<AST.Node, string>;
+	};
 }
 
 export interface TransformServerState extends BaseState {
@@ -1212,6 +1229,7 @@ export interface TransformServerState extends BaseState {
 	server_exported_names: string[];
 	dynamicElementName?: AST.TemplateLiteral;
 	applyParentCssScope?: AST.CSS.StyleSheet['hash'];
+	component?: AST.Component;
 }
 
 type UpdateList = Array<
@@ -1243,6 +1261,7 @@ export interface TransformClientState extends BaseState {
 	update: UpdateList | null;
 	errors: RippleCompileError[];
 	applyParentCssScope?: AST.CSS.StyleSheet['hash'];
+	component?: AST.Component;
 }
 
 /** Override zimmerframe types and provide our own */

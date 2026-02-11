@@ -1,4 +1,4 @@
-/** @import {AnalyzeOptions} from 'ripple/compiler'  */
+/** @import {AnalyzeOptions, RippleCompileError} from 'ripple/compiler'  */
 /**
 @import {
 	AnalysisResult,
@@ -8,8 +8,9 @@
 	Visitors,
 	TopScopedClasses,
 	StyleClasses,
+	ControlFlowChecks,
 } from '#compiler';
- */
+*/
 /**
 @import * as AST from 'estree';
 @import * as ESTreeJSX from 'estree-jsx';
@@ -39,10 +40,134 @@ import { validate_nesting } from './validation.js';
 
 const valid_in_head = new Set(['title', 'base', 'link', 'meta', 'style', 'script', 'noscript']);
 
+/** @returns {ControlFlowChecks} */
+function create_control_flow_checks() {
+	return {
+		registry: new Map(),
+		results: new Map(),
+	};
+}
+
+/**
+ * @param {ControlFlowChecks} checks
+ * @param {AST.Node} owner
+ * @param {string[]} requirements
+ */
+function register_check(checks, owner, requirements) {
+	if (!checks) return;
+	let owner_checks = checks.registry.get(owner);
+	if (!owner_checks) {
+		owner_checks = [];
+		checks.registry.set(owner, owner_checks);
+	}
+	owner_checks.push({
+		requirements,
+		satisfied: false,
+	});
+}
+
+/**
+ * @param {ControlFlowChecks} checks
+ * @param {AnalysisContext['path']} path
+ * @param {string} type
+ */
+function satisfy_check(checks, path, type) {
+	if (!checks) return;
+	for (let i = path.length - 1; i >= 0; i--) {
+		const node = path[i];
+		if (
+			node.type === 'Component' ||
+			node.type === 'FunctionExpression' ||
+			node.type === 'ArrowFunctionExpression' ||
+			node.type === 'FunctionDeclaration'
+		) {
+			break;
+		}
+
+		const owner_checks = checks.registry.get(node);
+		if (owner_checks) {
+			for (const check of owner_checks) {
+				if (!check.satisfied && check.requirements.includes(type)) {
+					check.satisfied = true;
+				}
+			}
+		}
+	}
+}
+
+/**
+ * @param {ControlFlowChecks | undefined} checks
+ * @param {AST.Node} owner
+ * @returns {boolean}
+ */
+function is_check_satisfied(checks, owner) {
+	if (!checks) return true;
+	const owner_checks = checks.registry.get(owner);
+	if (!owner_checks) return true;
+	for (const check of owner_checks) {
+		if (check.satisfied) return true;
+	}
+	return false;
+}
+
+/**
+ * @param {AST.BlockStatement | AST.Statement} block
+ * @param {string} filename
+ * @param {RippleCompileError[] | undefined} errors
+ */
+function check_unreachable_after_return(block, filename, errors) {
+	if (block.type !== 'BlockStatement') return;
+	const body = /** @type {AST.Node[]} */ (block.body);
+	let found_return = false;
+
+	for (const stmt of body) {
+		if (found_return && (stmt.type === 'Element' || stmt.type === 'Component')) {
+			error('Unreachable template content after return statement', filename, stmt, errors);
+		}
+		if (found_return && stmt.type === 'IfStatement') {
+			const has_template = if_statement_has_template(stmt);
+			if (has_template) {
+				error('Unreachable template content after return statement', filename, stmt, errors);
+			}
+		}
+		if (stmt.type === 'ReturnStatement') {
+			found_return = true;
+		}
+	}
+}
+
+/**
+ * @param {AST.IfStatement} node
+ * @returns {boolean}
+ */
+function if_statement_has_template(node) {
+	/**
+	 * @param {AST.BlockStatement | AST.Statement} body
+	 * @returns {boolean}
+	 */
+	const check_body = (body) => {
+		if (!body || body.type !== 'BlockStatement') return false;
+		const stmts = /** @type {AST.Node[]} */ (body.body);
+		for (const stmt of stmts) {
+			if (stmt.type === 'Element' || stmt.type === 'Component') {
+				return true;
+			}
+			if (stmt.type === 'IfStatement' && if_statement_has_template(stmt)) {
+				return true;
+			}
+		}
+		return false;
+	};
+
+	if (check_body(node.consequent)) return true;
+	if (node.alternate && check_body(node.alternate)) return true;
+	return false;
+}
+
 /**
  * @param {AnalysisContext['path']} path
  */
-function mark_control_flow_has_template(path) {
+function mark_control_flow_has_return(path) {
 	for (let i = path.length - 1; i >= 0; i -= 1) {
 		const node = path[i];
 
@@ -54,16 +179,8 @@ function mark_control_flow_has_template(path) {
 		) {
 			break;
 		}
-		if (
-			node.type === 'ForStatement' ||
-			node.type === 'ForInStatement' ||
-			node.type === 'ForOfStatement' ||
-			node.type === 'TryStatement' ||
-			node.type === 'IfStatement' ||
-			node.type === 'SwitchStatement' ||
-			node.type === 'TsxCompat'
-		) {
-			node.metadata.has_template = true;
+		if (node.type === 'IfStatement' || node.type === 'Element') {
+			node.metadata.has_return = true;
 		}
 	}
 }
@@ -445,11 +562,14 @@ const visitors = {
 		/** @type {TopScopedClasses} */
 		const topScopedClasses = new Map();
 
+		const control_flow_checks = create_control_flow_checks();
+
 		context.next({
 			...context.state,
 			elements,
 			function_depth: (context.state.function_depth ?? 0) + 1,
 			metadata,
+			control_flow_checks,
 		});
 
 		const css = node.css;
@@ -511,23 +631,20 @@ const visitors = {
 			return context.next();
 		}
 
+		const { control_flow_checks } = context.state;
+
 		context.visit(node.discriminant, context.state);
 
 		for (const switch_case of node.cases) {
-			// Skip empty cases
 			if (switch_case.consequent.length === 0) {
 				continue;
 			}
 
-			node.metadata = {
-				...node.metadata,
-				has_template: false,
-				has_await: false,
-			};
+			register_check(control_flow_checks, switch_case, ['template', 'await']);
 
 			context.visit(switch_case, context.state);
 
-			if (!node.metadata.has_template && !node.metadata.has_await) {
+			if (!is_check_satisfied(control_flow_checks, switch_case)) {
 				error(
 					'Component switch statements must contain a template or an await expression in each of their cases. Move the switch statement into an effect if it does not render anything.',
 					context.state.analysis.module.filename,
@@ -593,14 +710,13 @@ const visitors = {
 			}
 		}
 
-		node.metadata = {
-			...node.metadata,
-			has_template: false,
-			has_await: false,
-		};
+		const { control_flow_checks } = context.state;
+
+		register_check(control_flow_checks, node.body, ['template', 'await']);
+
 		context.next();
 
-		if (!node.metadata.has_template && !node.metadata.has_await) {
+		if (!is_check_satisfied(control_flow_checks, node.body)) {
 			error(
 				'Component for...of loops must contain a template or an await expression in their body. Move the for loop into an effect if it does not render anything.',
 				context.state.analysis.module.filename,
@@ -721,41 +837,104 @@ const visitors = {
 		context.next();
 	},
 
+	ReturnStatement(node, context) {
+		if (!is_inside_component(context)) {
+			return context.next();
+		}
+
+		if (node.argument !== null && node.argument !== undefined) {
+			error(
+				'Component return statements must not have a return value',
+				context.state.analysis.module.filename,
+				node,
+				context.state.loose ? context.state.analysis.errors : undefined,
+			);
+			return;
+		}
+
+		const condition_path = [];
+		let found_if = false;
+		/** @type {AST.IfStatement | AST.Element | null} */
+		let containing_node = null;
+
+		for (let i = context.path.length - 1; i >= 0; i -= 1) {
+			const ancestor = context.path[i];
+			if (ancestor.type === 'Component') {
+				break;
+			}
+			if (ancestor.type === 'IfStatement') {
+				found_if = true;
+				condition_path.unshift(ancestor.test);
+				containing_node = ancestor;
+			}
+			if (ancestor.type === 'Element' && !containing_node) {
+				containing_node = ancestor;
+			}
+		}
+
+		if (!found_if) {
+			error(
+				'Early return must be inside an if statement',
+				context.state.analysis.module.filename,
+				node,
+				context.state.loose ? context.state.analysis.errors : undefined,
+			);
+			return;
+		}
+
+		const component = is_inside_component(context, true);
+		if (component) {
+			component.metadata.returns = component.metadata.returns || [];
+			component.metadata.returns.push({
+				node,
+				condition_path,
+				containing_node,
+			});
+		}
+
+		mark_control_flow_has_return(context.path);
+		satisfy_check(context.state.control_flow_checks, context.path, 'return');
+	},
+
 	IfStatement(node, context) {
 		if (!is_inside_component(context)) {
 			return context.next();
 		}
 
-		node.metadata = {
-			...node.metadata,
-			has_template: false,
-			has_await: false,
-		};
+		const { control_flow_checks, analysis, loose } = context.state;
+		const filename = analysis.module.filename;
+		const errors = loose ? analysis.errors : undefined;
+
+		register_check(control_flow_checks, node.consequent, ['template', 'await', 'return']);
 
 		context.visit(node.consequent, context.state);
 
-		if (!node.metadata.has_template) {
+		if (!is_check_satisfied(control_flow_checks, node.consequent)) {
 			error(
 				'Component if statements must contain a template in their "then" body. Move the if statement into an effect if it does not render anything.',
-				context.state.analysis.module.filename,
+				filename,
 				node.consequent,
-				context.state.loose ? context.state.analysis.errors : undefined,
+				errors,
 			);
 		}
 
+		check_unreachable_after_return(node.consequent, filename, errors);
+
 		if (node.alternate) {
-			node.metadata.has_template = false;
-			node.metadata.has_await = false;
+			register_check(control_flow_checks, node.alternate, ['template', 'await', 'return']);
+
 			context.visit(node.alternate, context.state);
 
-			if (!node.metadata.has_template) {
+			if (!is_check_satisfied(control_flow_checks, node.alternate)) {
 				error(
 					'Component if statements must contain a template in their "else" body. Move the if statement into an effect if it does not render anything.',
-					context.state.analysis.module.filename,
+					filename,
 					node.alternate,
-					context.state.loose ? context.state.analysis.errors : undefined,
+					errors,
 				);
 			}
+
+			check_unreachable_after_return(node.alternate, filename, errors);
 		}
 	},
 
@@ -766,19 +945,17 @@ const visitors = {
 		}
 
 		if (node.pending) {
-			// Try/pending blocks indicate async operations
 			if (state.metadata?.await === false) {
 				state.metadata.await = true;
 			}
 
-			node.metadata = {
-				...node.metadata,
-				has_template: false,
-			};
+			const { control_flow_checks } = state;
+
+			register_check(control_flow_checks, node.block, ['template']);
 
 			context.visit(node.block, state);
 
-			if (!node.metadata.has_template) {
+			if (!is_check_satisfied(control_flow_checks, node.block)) {
 				error(
 					'Component try statements must contain a template in their main body. Move the try statement into an effect if it does not render anything.',
 					state.analysis.module.filename,
@@ -787,14 +964,11 @@ const visitors = {
 				);
 			}
 
-			node.metadata = {
-				...node.metadata,
-				has_template: false,
-			};
+			register_check(control_flow_checks, node.pending, ['template']);
 
 			context.visit(node.pending, state);
 
-			if (!node.metadata.has_template) {
+			if (!is_check_satisfied(control_flow_checks, node.pending)) {
 				error(
 					'Component try statements must contain a template in their "pending" body. Rendering a pending fallback is required to have a template.',
 					state.analysis.module.filename,
@@ -842,7 +1016,7 @@ const visitors = {
 	},
 
 	TsxCompat(_, context) {
-		mark_control_flow_has_template(context.path);
+		satisfy_check(context.state.control_flow_checks, context.path, 'template');
 		return context.next();
 	},
 
@@ -859,7 +1033,7 @@ const visitors = {
 		const is_dom_element = is_element_dom_element(node);
 		const attribute_names = new Set();
 
-		mark_control_flow_has_template(path);
+		satisfy_check(context.state.control_flow_checks, path, 'template');
 
 		validate_nesting(node, context);
 
@@ -1091,7 +1265,7 @@ const visitors = {
 	},
 
 	Text(node, context) {
-		mark_control_flow_has_template(context.path);
+		satisfy_check(context.state.control_flow_checks, context.path, 'template');
 		context.next();
 	},
 
@@ -1133,6 +1307,8 @@ const visitors = {
 			}
 			parent_block.metadata.has_await = true;
 		}
+
+		satisfy_check(context.state.control_flow_checks, context.path, 'await');
 
 		context.next();
 	},

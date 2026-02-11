@@ -3159,6 +3159,7 @@ export function parse(source, filename, options) {
 			sourceType: 'module',
 			ecmaVersion: 13,
 			locations: true,
+			allowReturnOutsideFunction: true,
 			onComment,
 			rippleOptions: {
 				filename,

@@ -217,6 +217,20 @@ export component App() {
 }
 ```
 
+**Early Return:**
+
+```jsx
+export component App() {
+  let isLoading = track(true);
+
+  if (@isLoading) {
+    <div>{'Loading...'}</div>
+    return;
+  }
+  <div>{'Content loaded!'}</div>
+}
+```
+
 **Loops:**
 
 ```jsx

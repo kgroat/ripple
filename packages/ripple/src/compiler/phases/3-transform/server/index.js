@@ -39,6 +39,8 @@ import {
 import { BLOCK_CLOSE, BLOCK_OPEN } from '../../../../constants.js';
 
 /**
+ * Transform children, applying synthetic if-wrapping for return statements.
+ * This handles the case where a return inside an element should skip siblings.
  * @param {AST.Node[]} children
  * @param {TransformServerContext} context
  */
@@ -49,6 +51,9 @@ function transform_children(children, context) {
 	for (const node of normalized) {
 		if (node.type === 'BreakStatement') {
 			state.init?.push(b.break);
+			continue;
+		}
+		if (node.type === 'ReturnStatement' && !node.argument) {
 			continue;
 		}
 		if (
@@ -91,6 +96,145 @@ function transform_children(children, context) {
 		state.init?.push(
 			b.stmt(b.assignment('=', b.member(b.id('__output'), b.id('target')), b.literal(null))),
 		);
+	}
+}
+
+/**
+ * @param {AST.Component} component
+ * @returns {Set<AST.Node>}
+ */
+function get_return_containers(component) {
+	const containers = new Set();
+	if (component.metadata?.returns) {
+		for (const ret of component.metadata.returns) {
+			if (ret.containing_node) {
+				containers.add(ret.containing_node);
+			}
+		}
+	}
+	return containers;
+}
+
+/**
+ * @param {AST.Node[]} body
+ * @param {Set<AST.Node>} return_containers
+ * @returns {number}
+ */
+function find_first_return_index(body, return_containers) {
+	for (let i = 0; i < body.length; i++) {
+		const stmt = body[i];
+		if ((stmt.type === 'IfStatement' || stmt.type === 'Element') && return_containers.has(stmt)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * @param {AST.Node[]} body
+ * @param {Set<AST.Node>} return_containers
+ * @returns {boolean}
+ */
+function needs_return_wrapping(body, return_containers) {
+	const first_return_index = find_first_return_index(body, return_containers);
+	return first_return_index !== -1 && first_return_index < body.length - 1;
+}
+
+/**
+ * Apply synthetic if-wrapping to siblings after a return statement.
+ * This ensures that content after a return is only rendered when the return condition is NOT met.
+ * Uses a hoisted variable to track if return was triggered, avoiding repeated condition evaluation.
+ * @param {AST.Node[]} body - The body (children or statements) to transform
+ * @param {AST.Identifier} returned_var - The hoisted variable to track return state
+ * @param {Set<AST.Node>} return_containers - Set of nodes that contain return statements
+ * @returns {AST.Node[]} - The transformed body with synthetic if-wrapping applied
+ */
+function apply_return_wrapping(body, returned_var, return_containers) {
+	const first_return_index = find_first_return_index(body, return_containers);
+	if (first_return_index === -1) return body;
+
+	const rest_body = body.slice(first_return_index + 1);
+	if (rest_body.length === 0) return body;
+
+	const return_stmt = body[first_return_index];
+	inject_return_flag(return_stmt, returned_var);
+
+	const transformed_rest_body = apply_return_wrapping(rest_body, returned_var, return_containers);
+	const synthetic_if = b.if(
+		b.unary('!', returned_var),
+		b.block(/** @type {AST.Statement[]} */ (transformed_rest_body)),
+		null,
+	);
+	synthetic_if.metadata = {
+		...synthetic_if.metadata,
+		has_template: true,
+		has_return: false,
+		has_await: false,
+	};
+	return [...body.slice(0, first_return_index + 1), synthetic_if];
+}
+
+/**
+ * Inject assignment to set the returned flag when a return path is taken.
+ * Modifies the return statement's containing if-block to set returned_var = true.
+ * @param {AST.Node} node - The if-statement or element containing the return
+ * @param {AST.Identifier} returned_var - The variable to set to true
+ */
+function inject_return_flag(node, returned_var) {
+	if (node.type === 'IfStatement') {
+		const consequent = node.consequent;
+		switch (consequent.type) {
+			case 'BlockStatement':
+				inject_return_flag_in_block(consequent.body, returned_var);
+				break;
+			case 'IfStatement':
+				inject_return_flag(consequent, returned_var);
+				break;
+			case 'ReturnStatement':
+				node.consequent = b.block([b.stmt(b.assignment('=', returned_var, b.true)), consequent]);
+				break;
+		}
+
+		if (node.alternate) {
+			const alternate = node.alternate;
+			switch (alternate.type) {
+				case 'BlockStatement':
+					inject_return_flag_in_block(alternate.body, returned_var);
+					break;
+				case 'IfStatement':
+					inject_return_flag(alternate, returned_var);
+					break;
+				case 'ReturnStatement':
+					node.alternate = b.block([b.stmt(b.assignment('=', returned_var, b.true)), alternate]);
+					break;
+			}
+		}
+	} else if (node.type === 'Element') {
+		inject_return_flag_in_block(node.children, returned_var);
+	}
+}
+
+/**
+ * Inject return flag assignment in a block of statements/children.
+ * @param {AST.Node[]} nodes - Array of statements or children
+ * @param {AST.Identifier} returned_var - The variable to set to true
+ */
+function inject_return_flag_in_block(nodes, returned_var) {
+	for (let i = 0; i < nodes.length; i++) {
+		const child = nodes[i];
+		if (child.type === 'ReturnStatement' && !child.argument) {
+			nodes.splice(i, 0, b.stmt(b.assignment('=', returned_var, b.true)));
+			i += 1;
+			continue;
+		}
+		if (child.type === 'IfStatement' && child.metadata?.has_return) {
+			inject_return_flag(child, returned_var);
+			continue;
+		}
+		if (child.type === 'Element' && child.metadata?.has_return) {
+			inject_return_flag(child, returned_var);
+			continue;
+		}
 	}
 }
 
@@ -189,14 +333,29 @@ const visitors = {
 			}
 		}
 
-		body_statements.push(
-			b.stmt(b.call('_$_.push_component')),
-			...transform_body(node.body, {
-				...context,
-				state: { ...context.state, component: node, metadata },
-			}),
-			b.stmt(b.call('_$_.pop_component')),
-		);
+		const return_containers = get_return_containers(node);
+		if (needs_return_wrapping(node.body, return_containers)) {
+			const returned_var = b.id('__returned');
+			const body_to_transform = apply_return_wrapping(node.body, returned_var, return_containers);
+			body_statements.push(
+				b.var(returned_var, b.false),
+				b.stmt(b.call('_$_.push_component')),
+				...transform_body(body_to_transform, {
+					...context,
+					state: { ...context.state, component: node, metadata },
+				}),
+				b.stmt(b.call('_$_.pop_component')),
+			);
+		} else {
+			body_statements.push(
+				b.stmt(b.call('_$_.push_component')),
+				...transform_body(node.body, {
+					...context,
+					state: { ...context.state, component: node, metadata },
+				}),
+				b.stmt(b.call('_$_.pop_component')),
+			);
+		}
 
 		let component_fn = b.function(
 			node.id,
@@ -667,8 +826,21 @@ const visitors = {
 			if (!is_void) {
 				/** @type {AST.Statement[]} */
 				const init = [];
+				let children_to_transform = node.children;
+				const return_containers = state.component
+					? get_return_containers(state.component)
+					: new Set();
+				if (needs_return_wrapping(node.children, return_containers)) {
+					const element_returned_var = b.id('__returned');
+					children_to_transform = apply_return_wrapping(
+						node.children,
+						element_returned_var,
+						return_containers,
+					);
+					init.push(b.var(element_returned_var, b.false));
+				}
 				transform_children(
-					node.children,
+					children_to_transform,
 					/** @type {TransformServerContext} */ ({
 						visit,
 						state: {

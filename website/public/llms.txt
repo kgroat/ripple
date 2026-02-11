@@ -373,6 +373,34 @@ component Conditional({ isVisible }) {
 }
 ```
 
+#### Early Return
+Components support early `return;` inside top-level `if` blocks as a guard-clause pattern. When the return condition is met, the rest of the component body is skipped. Only one `return` per component is allowed. Early return is fully reactive - when conditions change, the rest of the body appears or disappears accordingly.
+
+```ripple
+component ProtectedContent({ isAuthenticated }) {
+  if (!isAuthenticated) {
+    <div>{"Please log in"}</div>
+    return;
+  }
+  <div>{"Secret content"}</div>
+}
+```
+
+Nested conditions also work - the body is skipped when all conditions in the path to `return` are true:
+
+```ripple
+component Dashboard({ user, hasPermission }) {
+  if (user) {
+    <div>{"Welcome, "}{user.name}</div>
+    if (!hasPermission) {
+      <div>{"Access denied"}</div>
+      return;
+    }
+  }
+  <div>{"Dashboard content"}</div>
+}
+```
+
 #### Switch Statements
 Switch statements in Ripple provide a powerful way to conditionally render content based on the value of an expression. They are fully reactive and integrate seamlessly with Ripple's templating syntax.
 

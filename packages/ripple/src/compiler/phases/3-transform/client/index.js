@@ -459,13 +459,13 @@ const visitors = {
 		}
 	},
 
-	ServerIdentifier(node, context) {
+	ServerIdentifier(node, _context) {
 		const id = b.id(SERVER_IDENTIFIER);
 		id.metadata.source_name = '#server';
 		return { ...node, ...id };
 	},
 
-	StyleIdentifier(node, context) {
+	StyleIdentifier(node, _context) {
 		const id = b.id(STYLE_IDENTIFIER);
 		id.metadata.source_name = '#style';
 		return { ...node, ...id };
@@ -1462,8 +1462,14 @@ const visitors = {
 			const update = [];
 
 			if (!is_void) {
+				const return_containers = state.component
+					? get_return_containers(state.component)
+					: new Set();
+				const children_to_transform = needs_return_wrapping(node.children, return_containers)
+					? apply_return_wrapping(node.children, return_containers)
+					: node.children;
 				transform_children(
-					node.children,
+					children_to_transform,
 					/** @type {VisitorClientContext} */ ({
 						visit,
 						state: { ...state, init, update, namespace: child_namespace },
@@ -1810,9 +1816,15 @@ const visitors = {
 		}
 
 		const component_scope = context.state.scopes.get(node) || context.state.scope;
+
+		const return_containers = get_return_containers(node);
+		const body_to_transform = needs_return_wrapping(node.body, return_containers)
+			? apply_return_wrapping(node.body, return_containers)
+			: node.body;
+
 		const body_statements = [
 			b.stmt(b.call('_$_.push_component')),
-			...transform_body(node.body, {
+			...transform_body(body_to_transform, {
 				...context,
 				state: {
 					...context.state,
@@ -2829,6 +2841,10 @@ function transform_ts_child(node, context) {
 		}
 		state.init.push(/** @type {AST.Statement} */ (/** @type {unknown} */ (result)));
 	} else if (node.type === 'ReturnStatement') {
+		// Skip early returns inside component if-with-return (handled by condition-negation wrapper)
+		if (!node.argument && is_inside_component(context) && !state.to_ts) {
+			return;
+		}
 		const result = b.return(
 			node.argument ? /** @type {AST.Expression} */ (visit(node.argument, state)) : undefined,
 			/** @type {AST.NodeWithLocation} */ (node),
@@ -3160,6 +3176,141 @@ function transform_children(children, context) {
 			),
 		);
 	}
+}
+
+/**
+ * @param {AST.Node[]} nodes
+ * @returns {AST.Expression | null}
+ */
+function compute_return_condition_in_nodes(nodes) {
+	/** @type {AST.Expression | null} */
+	let cumulative = null;
+
+	for (const node of nodes) {
+		const current = compute_return_condition(node);
+		if (!current) continue;
+
+		/** @type {AST.Expression} */
+		let gated = current;
+		if (cumulative) {
+			gated = b.logical('&&', b.unary('!', cumulative), current);
+		}
+
+		cumulative = cumulative ? b.logical('||', cumulative, gated) : gated;
+	}
+
+	return cumulative;
+}
+
+/**
+ * @param {AST.Component} component
+ * @returns {Set<AST.Node>}
+ */
+function get_return_containers(component) {
+	const containers = new Set();
+	if (component.metadata?.returns) {
+		for (const ret of component.metadata.returns) {
+			if (ret.containing_node) {
+				containers.add(ret.containing_node);
+			}
+		}
+	}
+	return containers;
+}
+
+/**
+ * @param {AST.Node} node
+ * @returns {AST.Expression | null}
+ */
+function compute_return_condition(node) {
+	if (node.type === 'ReturnStatement' && !node.argument) {
+		return b.true;
+	}
+
+	if (node.type === 'BlockStatement') {
+		return compute_return_condition_in_nodes(node.body);
+	}
+
+	if (node.type === 'Element') {
+		return compute_return_condition_in_nodes(node.children);
+	}
+
+	if (node.type === 'IfStatement') {
+		const consequent_body =
+			node.consequent.type === 'BlockStatement' ? node.consequent.body : [node.consequent];
+		const consequent_condition = compute_return_condition_in_nodes(consequent_body);
+
+		let alternate_condition = null;
+		if (node.alternate) {
+			const alternate = node.alternate;
+			const alternate_body = alternate.type === 'BlockStatement' ? alternate.body : [alternate];
+			alternate_condition = compute_return_condition_in_nodes(alternate_body);
+		}
+
+		const consequent_expr = consequent_condition
+			? b.logical('&&', node.test, consequent_condition)
+			: null;
+		const alternate_expr = alternate_condition
+			? b.logical('&&', b.unary('!', node.test), alternate_condition)
+			: null;
+
+		if (consequent_expr && alternate_expr) return b.logical('||', consequent_expr, alternate_expr);
+		return consequent_expr || alternate_expr;
+	}
+
+	return null;
+}
+
+/**
+ * @param {AST.Node[]} body
+ * @param {Set<AST.Node>} return_containers
+ * @returns {number}
+ */
+function find_first_return_index(body, return_containers) {
+	for (let i = 0; i < body.length; i++) {
+		const stmt = body[i];
+		if ((stmt.type === 'IfStatement' || stmt.type === 'Element') && return_containers.has(stmt)) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * @param {AST.Node[]} body
+ * @param {Set<AST.Node>} return_containers
+ * @returns {boolean}
+ */
+function needs_return_wrapping(body, return_containers) {
+	const first_return_index = find_first_return_index(body, return_containers);
+	return first_return_index !== -1 && first_return_index < body.length - 1;
+}
+
+/**
+ * Apply synthetic if-wrapping to siblings after a return statement.
+ * This ensures that content after a return is only rendered when the return condition is NOT met.
+ * @param {AST.Node[]} body - The body (children or statements) to transform
+ * @param {Set<AST.Node>} return_containers - Set of nodes that contain return statements
+ * @returns {AST.Node[]} - The transformed body with synthetic if-wrapping applied
+ */
+function apply_return_wrapping(body, return_containers) {
+	const first_return_index = find_first_return_index(body, return_containers);
+	if (first_return_index === -1) return body;
+
+	const rest_body = body.slice(first_return_index + 1);
+	if (rest_body.length === 0) return body;
+
+	const return_stmt = body[first_return_index];
+	const return_condition = compute_return_condition(return_stmt);
+	if (!return_condition) return body;
+
+	const transformed_rest_body = apply_return_wrapping(rest_body, return_containers);
+	const synthetic_if = b.if(
+		b.unary('!', return_condition),
+		b.block(/** @type {AST.Statement[]} */ (transformed_rest_body)),
+		null,
+	);
+	return [...body.slice(0, first_return_index + 1), synthetic_if];
 }
 
 /**
